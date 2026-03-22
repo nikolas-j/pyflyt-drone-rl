@@ -27,7 +27,8 @@ import numpy as np
 import PyFlyt.gym_envs  # noqa: F401  Side-effect: registers PyFlyt envs.
 
 ENV_ID     = "PyFlyt/QuadX-Hover-v3"
-FLIGHT_MODE = 7   # high-level velocity control: [vx, vy, vz, yaw_rate]
+FLIGHT_MODE = 6   # ground-velocity control: [vx, vy, yaw_rate, vz]
+DEFAULT_EPISODE_SECONDS = 10.0
 
 
 class BaseDroneEnv(gym.Env):
@@ -37,12 +38,16 @@ class BaseDroneEnv(gym.Env):
         self,
         render_mode: str | None = None,
         start_pos: np.ndarray | list[float] | tuple[float, float, float] | None = None,
+        max_duration_seconds: float = DEFAULT_EPISODE_SECONDS,
+        flight_dome_size: float = 10.0,
     ) -> None:
         super().__init__()
         self._inner: gym.Env = gym.make(
             ENV_ID,
             flight_mode=FLIGHT_MODE,
             render_mode=render_mode,
+            max_duration_seconds=max_duration_seconds,
+            flight_dome_size=flight_dome_size,
         )
         self.observation_space = self._inner.observation_space
         self.action_space      = self._inner.action_space
@@ -53,6 +58,11 @@ class BaseDroneEnv(gym.Env):
                 shape=self.action_space.shape,
                 dtype=np.float32,
             )
+        if FLIGHT_MODE == 6 and isinstance(self.action_space, gym.spaces.Box):
+            low = np.asarray(self.action_space.low, dtype=np.float32).copy()
+            high = np.asarray(self.action_space.high, dtype=np.float32).copy()
+            low[3] = -high[3]
+            self.action_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
         self.render_mode       = render_mode
         self._start_pos        = self._coerce_start_pos(start_pos)
 
@@ -77,8 +87,9 @@ class BaseDroneEnv(gym.Env):
         return obs, info
 
     def step(self, action):
-        action = np.asarray(action, dtype=np.float32)
+        action = self._coerce_action(action)
         obs, raw_reward, terminated, truncated, info = self._inner.step(action)
+        info["_inner_terminated"] = bool(terminated)
 
         reward     = self.shape_reward(obs, raw_reward, info)
         terminated = terminated or self.is_terminated(obs, info)
@@ -94,6 +105,12 @@ class BaseDroneEnv(gym.Env):
     # ------------------------------------------------------------------
     # Spawn position helpers
     # ------------------------------------------------------------------
+
+    def _coerce_action(self, action) -> np.ndarray:
+        action_array = np.asarray(action, dtype=np.float32)
+        if isinstance(self.action_space, gym.spaces.Box):
+            action_array = np.clip(action_array, self.action_space.low, self.action_space.high)
+        return action_array
 
     @staticmethod
     def _coerce_start_pos(

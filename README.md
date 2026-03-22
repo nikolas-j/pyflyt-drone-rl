@@ -7,16 +7,16 @@ PyFlyt drone simulation with environments, goal types, and training/play entry p
 ```
 PyFlytDroneSim/
 ├── envs/
-│   ├── base_drone_env.py   # thin PyFlyt wrapper (flight_mode=7, action coercion)
-│   ├── hover_env.py        # Stage 1 — hold position at (0,0,1)
-│   ├── waypoint_env.py     # Stage 2 — navigate to random goals
-│   └── gate_env.py         # Stage 3 — detector wrapper (applies to any env)
+│   ├── base_drone_env.py   # thin PyFlyt wrapper
+│   ├── hover_env.py        # Stage 1 — single stationary goal
+│   ├── waypoint_env.py     # Stage 2 — chained waypoint navigation
+│   └── gate_env.py         # Stage 3 — detector wrapper
 ├── goals/
 │   ├── static_point.py     # fixed XYZ target
 │   ├── moving_point.py     # randomly-reset / animatable goal
-│   └── gate.py             # X-plane gate with Y/Z opening bounds
-├── hover_test.py           # zero-command smoke test (no training)
-├── train.py                # CLI: --task hover|waypoint|gate  --mode train|play
+│   └── gate.py             # 
+├── hover_test.py           # smoke test (no training)
+├── train.py                # Main entry point (tra)
 ├── pyproject.toml
 └── README.md
 ```
@@ -37,35 +37,29 @@ uv sync
 
 ## 2) Quick smoke test (no training)
 
-Opens the PyBullet GUI, sends zero velocity commands, and prints telemetry:
-
 ```bash
 uv run python hover_test.py
 ```
 
-### Explicit drone spawn position
 
-You can now set the drone spawn point explicitly for hover/waypoint envs:
+## 3) Train a policy
 
-```python
-from envs import HoverEnv
+Per-episode run duration defaults to **10 seconds**.
 
-# Fixed spawn for all episodes
-env = HoverEnv(start_pos=[1.0, 0.0, 1.8])
+Waypoint and gate tasks use PyFlyt flight mode **6** (`vx, vy, yaw_rate, vz`) --> policy commands horizontal velocity plus vertical climb/descent velocity.
 
-# Or override per reset
-obs, info = env.reset(options={"start_pos": [2.5, -1.0, 2.0]})
-```
-
-`start_pos` accepts shape `(3,)` or `(1, 3)` and maps to PyFlyt's internal `start_pos`.
-
-## 3) Train an agent
 
 | Task | Command |
 |---|---|
-| Hover at (0,0,1) | `uv run python train.py --task hover --mode train` |
+| Hover at (0,3,2) | `uv run python train.py --task hover --mode train` |
 | Navigate to waypoints | `uv run python train.py --task waypoint --mode train` |
-| Fly through a gate | `uv run python train.py --task gate --mode train` |
+| Fly through gates | `uv run python train.py --task gate --mode train` |
+
+Set a longer per-episode duration (for example, 20s):
+
+```bash
+uv run python train.py --task hover --mode train --episode-seconds 20
+```
 
 **Resume training from a checkpoint:**
 
@@ -99,10 +93,9 @@ tensorboard --logdir ./logs/
 ```bash
 uv run python train.py --task hover --mode play
 uv run python train.py --task hover --mode play --episodes 10
+uv run python train.py --task hover --mode play --episode-seconds 20
 uv run python train.py --task hover --mode play --load models/my_best_hover
 ```
-
-A PyBullet GUI window opens and the agent flies using its learned policy.
 
 ## Model metadata and progress visibility
 
@@ -115,3 +108,39 @@ checkpoint in `models/`:
 Before both train and play modes, the script prints a model info summary
 including model name, algorithm/network, task/env/reward profile, and
 `total_timesteps` trained so far.
+
+
+
+
+## Tasks
+
+### envs/waypoint_env.py
+
+For training a baseline policy with 100k training steps:
+```bash
+# ── Reward hyper-parameters ───────────────────────────────────────────────────
+PROGRESS_COEF = 5.0
+PROGRESS_CLIP = 0.20
+REACH_RADIUS = 0.35
+REACH_BONUS = 1.50
+CRASH_PENALTY = 5.0
+
+# ── Spawn and goal sampling ───────────────────────────────────────────────────
+START_XY_RANGE = 1.5
+START_Z_MIN = 1.0
+START_Z_MAX = 2.5
+
+GOAL_XY_RANGE = 3.0
+GOAL_Z_MIN = 1.0
+GOAL_Z_MAX = 3.0
+GOAL_MIN_SEPARATION = 1.0
+
+# ── Goal visualization ─────────────────────────────────────────────────────────
+GOAL_RGBA = (0.2, 0.9, 1.0, 0.35)
+GOAL_VISUAL_RADIUS = REACH_RADIUS
+
+# ── Sim ─────────────────────────────────────────────────────────
+DEFAULT_EPISODE_SECONDS = 25.0
+DEFAULT_FLIGHT_DOME_SIZE = 10.0
+```
+

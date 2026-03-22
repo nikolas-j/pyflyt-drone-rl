@@ -1,48 +1,44 @@
 """
 hover_env.py
 ------------
-Stage 1 environment: reward the agent for hovering near a fixed point.
+Stage 1 environment: fly to and hover around a fixed target point.
 
-Observation layout (21-dim, from PyFlyt QuadX-Hover-v3 in flight_mode=7)
--------------------------------------------------------------------------
-Index  Meaning
-    0-2  Angular velocities
-    3-6  Quaternion (x, y, z, w)
-    7-9  Linear velocities
- 10-12 World position (x, y, z)
- 13-16 Previous action
- 17-20 Auxiliary state / motor data
+Model observation (10-dim)
+--------------------------
+The policy receives only the MVP navigation signal:
+- 0:3   relative target vector (target_pos - world_pos)
+- 3:6   linear velocity (vx, vy, vz)
+- 6:10  orientation quaternion (x, y, z, w)
 
-Hover-v3 does not expose a target-displacement vector, so we compute reward
-from the drone's world position at indices 10-12.
+PyFlyt still provides a raw 21-dim observation internally. This wrapper
+transforms raw observations before returning them to PPO.
 
 Reward
 ------
-r = -DIST_COEF * dist(drone, target)            dense distance shaping
-    + PROGRESS_COEF * (prev_dist - dist)          reward moving toward target
-    + STAY_BONUS  if dist < STAY_THRESHOLD         stronger near-target reward
-    - EFFORT_COEF * ||action||²                    optional control penalty
+r = PROGRESS_COEF * clip(prev_dist - dist, -PROGRESS_CLIP, +PROGRESS_CLIP)
+    + SUCCESS_BONUS   if dist < SUCCESS_RADIUS
+    - CRASH_PENALTY   if inner env terminates
 
 Spawn policy (default)
 ----------------------
 Unless an explicit start_pos is provided, each episode starts from an easy
-distribution around z≈1 so PPO can reliably discover climb-to-hover behavior.
+distribution around z≈1 so PPO can reliably discover climb-to-target behavior.
 """
 
 from __future__ import annotations
 
+import gymnasium as gym
 import numpy as np
 
 from .base_drone_env import BaseDroneEnv
 from goals.static_point import StaticPoint
 
 # ── Reward hyper-parameters ───────────────────────────────────────────────────
-DIST_COEF      = 1.0    # global distance shaping scale
-PROGRESS_COEF  = 2.0    # weight for per-step progress (prev_dist - dist)
-PROGRESS_CLIP  = 0.20   # clip progress to stabilise rare spikes
-STAY_THRESHOLD = 0.20   # metres — "close enough" for hover bonus
-STAY_BONUS     = 0.30   # extra reward per step while inside threshold
-EFFORT_COEF    = 0.0    # keep at 0 initially to avoid suppressing exploration
+PROGRESS_COEF  = 5.0    # scale progress term to roughly [-1, 1] per step
+PROGRESS_CLIP  = 0.20   # clip progress spikes for stable PPO updates
+SUCCESS_RADIUS = 0.30   # metres — "inside goal" threshold
+SUCCESS_BONUS  = 0.20   # per-step bonus while inside SUCCESS_RADIUS
+CRASH_PENALTY  = 5.0    # one-shot penalty when inner env terminates
 
 # Easy spawn distribution for hover learning (if start_pos not set explicitly)
 SPAWN_XY_RANGE = 0.25
@@ -50,7 +46,10 @@ SPAWN_Z_MIN    = 0.90
 SPAWN_Z_MAX    = 1.10
 
 # Target position.  Change to (0.0, 0.0, 2.0) etc. to hover at other heights.
-TARGET_POS = np.array([0.0, 0.0, 2.0], dtype=np.float32)
+TARGET_POS = np.array([0.0, 3.0, 2.0], dtype=np.float32)
+
+DEFAULT_EPISODE_SECONDS = 12.0
+DEFAULT_FLIGHT_DOME_SIZE = 2.0  # Small allowable area since spawn range is only ±0.25m
 
 
 class HoverEnv(BaseDroneEnv):
@@ -60,8 +59,21 @@ class HoverEnv(BaseDroneEnv):
         self,
         render_mode: str | None = None,
         start_pos: np.ndarray | list[float] | tuple[float, float, float] | None = None,
+        max_duration_seconds: float = DEFAULT_EPISODE_SECONDS,
+        flight_dome_size: float = DEFAULT_FLIGHT_DOME_SIZE,
     ) -> None:
-        super().__init__(render_mode=render_mode, start_pos=start_pos)
+        super().__init__(
+            render_mode=render_mode,
+            start_pos=start_pos,
+            max_duration_seconds=max_duration_seconds,
+            flight_dome_size=flight_dome_size,
+        )
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(10,),
+            dtype=np.float32,
+        )
         self.goal = StaticPoint(pos=TARGET_POS)
         self._last_action: np.ndarray = np.zeros(4, dtype=np.float32)
         self._prev_dist: float | None = None
@@ -73,8 +85,16 @@ class HoverEnv(BaseDroneEnv):
     # ------------------------------------------------------------------
 
     def step(self, action):
-        self._last_action = np.asarray(action, dtype=np.float32)
-        return super().step(action)
+        self._last_action = self._coerce_action(action)
+        raw_obs, raw_reward, inner_terminated, truncated, info = self._inner.step(self._last_action)
+        info["_inner_terminated"] = bool(inner_terminated)
+        info["world_pos"] = np.asarray(raw_obs[10:13], dtype=np.float32).copy()
+
+        reward = self.shape_reward(raw_obs, raw_reward, info)
+        terminated = inner_terminated or self.is_terminated(raw_obs, info)
+
+        obs = self._transform_obs(raw_obs)
+        return obs, reward, terminated, truncated, info
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         if seed is not None:
@@ -86,10 +106,14 @@ class HoverEnv(BaseDroneEnv):
         if "start_pos" not in options and self._sample_spawn_each_reset:
             options["start_pos"] = self._sample_easy_start_pos()
 
-        obs, info = super().reset(seed=seed, options=options)
-        self._prev_dist = self.goal.distance_from_world(obs[10:13])
+        raw_obs, info = super().reset(seed=seed, options=options)
+        info["world_pos"] = np.asarray(raw_obs[10:13], dtype=np.float32).copy()
+
+        self._prev_dist = self.goal.distance_from_world(raw_obs[10:13])
         info["distance_to_target"] = float(self._prev_dist)
         info["target_pos"] = self.goal.pos.copy()
+
+        obs = self._transform_obs(raw_obs)
         return obs, info
 
     def reset_goal(self) -> None:
@@ -107,14 +131,19 @@ class HoverEnv(BaseDroneEnv):
         else:
             progress = float(np.clip(self._prev_dist - dist, -PROGRESS_CLIP, PROGRESS_CLIP))
 
-        effort = float(np.dot(self._last_action, self._last_action))
-        reward = -DIST_COEF * dist + PROGRESS_COEF * progress - EFFORT_COEF * effort
-        if dist < STAY_THRESHOLD:
-            reward += STAY_BONUS
+        reward = PROGRESS_COEF * progress
+        if dist < SUCCESS_RADIUS:
+            reward += SUCCESS_BONUS
+
+        crashed = bool(info.get("_inner_terminated", False))
+        if crashed:
+            reward -= CRASH_PENALTY
 
         info["distance_to_target"] = float(dist)
         info["progress_to_target"] = float(progress)
         info["hover_reward"] = float(reward)
+        info["hover_success"] = bool(dist < SUCCESS_RADIUS)
+        info["hover_crash"] = crashed
 
         self._prev_dist = dist
         return reward
@@ -124,6 +153,14 @@ class HoverEnv(BaseDroneEnv):
         y = float(self._rng.uniform(-SPAWN_XY_RANGE, SPAWN_XY_RANGE))
         z = float(self._rng.uniform(SPAWN_Z_MIN, SPAWN_Z_MAX))
         return [x, y, z]
+
+    def _transform_obs(self, raw_obs: np.ndarray) -> np.ndarray:
+        raw = np.asarray(raw_obs, dtype=np.float32)
+        world_pos = raw[10:13]
+        rel_target = self.goal.pos.astype(np.float32) - world_pos
+        velocity = raw[7:10]
+        quaternion = raw[3:7]
+        return np.concatenate((rel_target, velocity, quaternion), dtype=np.float32)
 
     def is_terminated(self, obs: np.ndarray, info: dict) -> bool:
         return False   # rely on PyFlyt's own crash / timeout termination

@@ -40,7 +40,7 @@ from model_registry import (
 )
 
 
-WAYPOINT_START_POS = [0.0, 0.0, 1.0]
+DEFAULT_EPISODE_SECONDS = 10.0
 
 
 # ── Task registry ─────────────────────────────────────────────────────────────
@@ -48,14 +48,14 @@ WAYPOINT_START_POS = [0.0, 0.0, 1.0]
 # For GateEnv we wrap HoverEnv: change the inner env here to WaypointEnv for
 # a harder variant.
 
-def _make_hover(render_mode):
-    return HoverEnv(render_mode=render_mode)
+def _make_hover(render_mode, episode_seconds: float):
+    return HoverEnv(render_mode=render_mode, max_duration_seconds=episode_seconds)
 
-def _make_waypoint(render_mode):
-    return WaypointEnv(render_mode=render_mode, start_pos=WAYPOINT_START_POS)
+def _make_waypoint(render_mode, episode_seconds: float):
+    return WaypointEnv(render_mode=render_mode, max_duration_seconds=episode_seconds)
 
-def _make_gate(render_mode):
-    inner = HoverEnv(render_mode=render_mode)
+def _make_gate(render_mode, episode_seconds: float):
+    inner = HoverEnv(render_mode=render_mode, max_duration_seconds=episode_seconds)
     return GateEnv(inner, gate=Gate(x_plane=3.0, y_bounds=(-0.5, 0.5), z_bounds=(0.5, 1.5)))
 
 ENV_FACTORIES = {
@@ -90,17 +90,17 @@ PLAY_COORD_PRINT_EVERY = 5
 TASK_PROFILES = {
     "hover": {
         "env_id": "PyFlyt/QuadX-Hover-v3",
-        "flight_mode": 7,
-        "reward_profile": "hover_dense_progress_v1",
+        "flight_mode": 6,
+        "reward_profile": "hover_progress_success_crash_v2",
     },
     "waypoint": {
-        "env_id": "PyFlyt/QuadX-Waypoints-v3",
-        "flight_mode": 7,
-        "reward_profile": "waypoint_distance_bonus_v1",
+        "env_id": "CustomWaypointEnv(PyFlyt/QuadX-Hover-v3)",
+        "flight_mode": 6,
+        "reward_profile": "waypoint_chained_progress_v1",
     },
     "gate": {
         "env_id": "PyFlyt/QuadX-Hover-v3 + GateEnv",
-        "flight_mode": 7,
+        "flight_mode": 6,
         "reward_profile": "gate_shaping_sparse_v1",
     },
 }
@@ -144,13 +144,15 @@ def _print_model_info(mode: str, model_path: str, metadata: dict) -> None:
 
 
 def _extract_world_pos(obs, info: dict) -> tuple[float, float, float] | None:
+    if "world_pos" in info and info["world_pos"] is not None:
+        world_pos = info["world_pos"]
+        if len(world_pos) >= 3:
+            return (float(world_pos[0]), float(world_pos[1]), float(world_pos[2]))
+
     if "state" in info and info["state"] is not None:
         state = info["state"]
         if len(state) >= 3:
             return (float(state[0]), float(state[1]), float(state[2]))
-
-    if obs is not None and len(obs) >= 13:
-        return (float(obs[10]), float(obs[11]), float(obs[12]))
 
     return None
 
@@ -159,7 +161,7 @@ def _extract_world_pos(obs, info: dict) -> tuple[float, float, float] | None:
 #  train()
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train(task: str, load_path: str | None, total_timesteps: int) -> None:
+def train(task: str, load_path: str | None, total_timesteps: int, episode_seconds: float) -> None:
     os.makedirs(LOG_DIR,   exist_ok=True)
     os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -179,7 +181,7 @@ def train(task: str, load_path: str | None, total_timesteps: int) -> None:
     )
     save_metadata(save_path, save_meta)
 
-    env = Monitor(ENV_FACTORIES[task](render_mode=None), LOG_DIR)
+    env = Monitor(ENV_FACTORIES[task](render_mode=None, episode_seconds=episode_seconds), LOG_DIR)
 
     print("[check_env] Validating environment API...")
     check_env(env, warn=True)
@@ -220,7 +222,7 @@ def train(task: str, load_path: str | None, total_timesteps: int) -> None:
 #  play()
 # ─────────────────────────────────────────────────────────────────────────────
 
-def play(task: str, model_path: str | None, n_episodes: int) -> None:
+def play(task: str, model_path: str | None, n_episodes: int, episode_seconds: float) -> None:
     resolved = model_path or os.path.join(MODEL_DIR, f"{task}_ppo")
     if not os.path.exists(resolved + ".zip"):
         print(f"[play] ERROR: '{resolved}.zip' not found.")
@@ -234,7 +236,7 @@ def play(task: str, model_path: str | None, n_episodes: int) -> None:
     print(f"[play] Loading '{resolved}.zip'...")
     model = PPO.load(resolved)
 
-    env = ENV_FACTORIES[task](render_mode="human")
+    env = ENV_FACTORIES[task](render_mode="human", episode_seconds=episode_seconds)
 
     for ep in range(1, n_episodes + 1):
         obs, info = env.reset()
@@ -306,10 +308,16 @@ if __name__ == "__main__":
         default=5,
         help="Number of episodes to run in play mode.",
     )
+    parser.add_argument(
+        "--episode-seconds",
+        type=float,
+        default=DEFAULT_EPISODE_SECONDS,
+        help="Per-episode max simulation duration in seconds (train and play).",
+    )
 
     args = parser.parse_args()
 
     if args.mode == "train":
-        train(args.task, args.load, args.timesteps)
+        train(args.task, args.load, args.timesteps, args.episode_seconds)
     else:
-        play(args.task, args.load, args.episodes)
+        play(args.task, args.load, args.episodes, args.episode_seconds)

@@ -55,3 +55,6 @@ class MovingPoint:
 
     def distance_from_displacement(self, displacement: np.ndarray) -> float:
         return float(np.linalg.norm(np.asarray(displacement, dtype=np.float32)))
+
+    def distance_from_world(self, drone_pos: np.ndarray) -> float:
+        return float(np.linalg.norm(np.asarray(drone_pos, dtype=np.float32) - self.pos))
