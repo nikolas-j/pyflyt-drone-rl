@@ -1,7 +1,6 @@
 # PyFlyt Drone Sim
 
-Multi-task PyFlyt drone simulation project with clean separation of
-environments, goal types, and a single training/play entry point.
+PyFlyt drone simulation with environments, goal types, and training/play entry point.
 
 ## Project structure
 
@@ -27,7 +26,7 @@ PyFlytDroneSim/
 ```bash
 uv python install 3.12
 uv python pin 3.12
-uv add "gymnasium==0.29.1" "numpy>=1.26,<2" "PyFlyt==0.28.0" "stable-baselines3>=2.3" "rich"
+uv add "gymnasium==0.29.1" "numpy>=1.26,<2" "PyFlyt==0.28.0" "stable-baselines3>=2.3" "tensorboard" "tqdm" "rich"
 ```
 
 Or sync from the lock file:
@@ -44,6 +43,22 @@ Opens the PyBullet GUI, sends zero velocity commands, and prints telemetry:
 uv run python hover_test.py
 ```
 
+### Explicit drone spawn position
+
+You can now set the drone spawn point explicitly for hover/waypoint envs:
+
+```python
+from envs import HoverEnv
+
+# Fixed spawn for all episodes
+env = HoverEnv(start_pos=[1.0, 0.0, 1.8])
+
+# Or override per reset
+obs, info = env.reset(options={"start_pos": [2.5, -1.0, 2.0]})
+```
+
+`start_pos` accepts shape `(3,)` or `(1, 3)` and maps to PyFlyt's internal `start_pos`.
+
 ## 3) Train an agent
 
 | Task | Command |
@@ -57,6 +72,15 @@ uv run python hover_test.py
 ```bash
 uv run python train.py --task hover --mode train --load models/hover_ppo
 ```
+
+### Training flow (checkpoint naming)
+
+- Default save target is task-based: `models/<task>_ppo.zip`.
+- Running train **without** `--load` creates/overwrites that default checkpoint.
+- Running train **with** `--load models/some_other_name` loads that model for initialization,
+	but training is still saved to the default task checkpoint (`models/<task>_ppo.zip`).
+- This means a non-default loaded model stays persisted, while the updated result is written
+	to the default task-named checkpoint.
 
 **Change training budget:**
 
@@ -80,30 +104,14 @@ uv run python train.py --task hover --mode play --load models/my_best_hover
 
 A PyBullet GUI window opens and the agent flies using its learned policy.
 
-## RL Roadmap: Hover → Waypoints → Gates
+## Model metadata and progress visibility
 
-### Stage 1 — Hover (`envs/hover_env.py`)
+`train.py` maintains a per-model sidecar metadata file next to each
+checkpoint in `models/`:
 
-Train in `PyFlyt/QuadX-Hover-v3` with shaped reward for holding $(0,0,1)$:
+- `models/<model_name>.zip`         (SB3 checkpoint)
+- `models/<model_name>.meta.json`   (metadata + progress)
 
-$$r = -\lVert p - p^* \rVert_2 + r_{\text{stay}} - \lambda \lVert a \rVert^2$$
-
-- $r_{\text{stay}} = +0.10$ per step while within 0.20 m of target
-- $\lambda = 0.005$ control effort penalty
-
-### Stage 2 — Waypoints (`envs/waypoint_env.py`)
-
-Switch to `PyFlyt/QuadX-Waypoints-v3`.  The goal resets to a new random
-position each episode.  `goals/moving_point.py` provides the goal object;
-subclass `MovingPoint.tick()` to add animated motion (orbiting, sinusoidal,
-etc.).
-
-### Stage 3 — Gates (`envs/gate_env.py`)
-
-`GateEnv` is a `gymnasium.Wrapper` that can wrap *any* inner env.  It
-detects when the drone crosses an X-plane gate:
-
-$$(x_{t-1} - x_g)(x_t - x_g) < 0 \quad \text{AND} \quad y,z \in \text{opening bounds}$$
-
-On a valid pass: sparse $+5.0$ reward and episode ends.  Remove the
-termination line in `gate_env.py` to chain multiple gates in sequence.
+Before both train and play modes, the script prints a model info summary
+including model name, algorithm/network, task/env/reward profile, and
+`total_timesteps` trained so far.

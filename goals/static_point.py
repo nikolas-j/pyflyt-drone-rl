@@ -38,7 +38,7 @@ class StaticPoint:
         """
         Euclidean distance from a (dx, dy, dz) displacement vector.
 
-        PyFlyt's observation indices 13-15 give the vector from the drone
-        to the target, so ||displacement|| == distance to target.
+        Use this only in environments that explicitly expose a target
+        displacement vector in the observation.
         """
         return float(np.linalg.norm(np.asarray(displacement, dtype=np.float32)))

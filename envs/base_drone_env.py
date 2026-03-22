@@ -14,7 +14,7 @@ Responsibilities
 
 Subclasses override
 -------------------
-- `compute_reward(obs, raw_reward, info)` — return a float
+- `shape_reward(obs, raw_reward, info)` — return a float
 - `is_terminated(obs, info)`              — return bool
 - `reset_goal()`                          — called at the start of each
                                             episode; subclasses spawn goals
@@ -33,7 +33,11 @@ FLIGHT_MODE = 7   # high-level velocity control: [vx, vy, vz, yaw_rate]
 class BaseDroneEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"]}
 
-    def __init__(self, render_mode: str | None = None) -> None:
+    def __init__(
+        self,
+        render_mode: str | None = None,
+        start_pos: np.ndarray | list[float] | tuple[float, float, float] | None = None,
+    ) -> None:
         super().__init__()
         self._inner: gym.Env = gym.make(
             ENV_ID,
@@ -42,14 +46,33 @@ class BaseDroneEnv(gym.Env):
         )
         self.observation_space = self._inner.observation_space
         self.action_space      = self._inner.action_space
+        if isinstance(self.action_space, gym.spaces.Box) and self.action_space.dtype != np.float32:
+            self.action_space = gym.spaces.Box(
+                low=np.asarray(self.action_space.low, dtype=np.float32),
+                high=np.asarray(self.action_space.high, dtype=np.float32),
+                shape=self.action_space.shape,
+                dtype=np.float32,
+            )
         self.render_mode       = render_mode
+        self._start_pos        = self._coerce_start_pos(start_pos)
 
     # ------------------------------------------------------------------
     # Gymnasium interface
     # ------------------------------------------------------------------
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
-        obs, info = self._inner.reset(seed=seed, options=options)
+        options = dict(options or {})
+
+        # Optional per-episode spawn override: reset(options={"start_pos": [x, y, z]})
+        requested_start_pos = options.pop("start_pos", None)
+        if requested_start_pos is not None:
+            self._start_pos = self._coerce_start_pos(requested_start_pos)
+
+        # PyFlyt QuadX envs consume `unwrapped.start_pos` during begin_reset().
+        if self._start_pos is not None and hasattr(self._inner.unwrapped, "start_pos"):
+            self._inner.unwrapped.start_pos = self._start_pos.copy()
+
+        obs, info = self._inner.reset(seed=seed, options=options or None)
         self.reset_goal()
         return obs, info
 
@@ -57,7 +80,7 @@ class BaseDroneEnv(gym.Env):
         action = np.asarray(action, dtype=np.float32)
         obs, raw_reward, terminated, truncated, info = self._inner.step(action)
 
-        reward     = self.compute_reward(obs, raw_reward, info)
+        reward     = self.shape_reward(obs, raw_reward, info)
         terminated = terminated or self.is_terminated(obs, info)
 
         return obs, reward, terminated, truncated, info
@@ -69,10 +92,29 @@ class BaseDroneEnv(gym.Env):
         self._inner.close()
 
     # ------------------------------------------------------------------
+    # Spawn position helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _coerce_start_pos(
+        start_pos: np.ndarray | list[float] | tuple[float, float, float] | None,
+    ) -> np.ndarray | None:
+        if start_pos is None:
+            return None
+        arr = np.asarray(start_pos, dtype=np.float64)
+        if arr.shape == (3,):
+            arr = arr.reshape(1, 3)
+        if arr.shape != (1, 3):
+            raise ValueError(
+                "start_pos must be shape (3,) or (1, 3), e.g. [0.0, 0.0, 1.5]"
+            )
+        return arr
+
+    # ------------------------------------------------------------------
     # Extension points for subclasses
     # ------------------------------------------------------------------
 
-    def compute_reward(self, obs: np.ndarray, raw_reward: float, info: dict) -> float:
+    def shape_reward(self, obs: np.ndarray, raw_reward: float, info: dict) -> float:
         """Override in subclasses. Default: pass PyFlyt's built-in reward through."""
         return float(raw_reward)
 

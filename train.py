@@ -29,6 +29,18 @@ from stable_baselines3.common.monitor import Monitor
 from envs import HoverEnv, WaypointEnv, GateEnv
 from envs.gate_env import GateEnv as _GateEnv
 from goals.gate import Gate
+from model_registry import (
+    format_model_info,
+    get_or_create_metadata,
+    mark_play,
+    mark_train_end,
+    mark_train_start,
+    save_metadata,
+    set_total_timesteps,
+)
+
+
+WAYPOINT_START_POS = [0.0, 0.0, 1.0]
 
 
 # ── Task registry ─────────────────────────────────────────────────────────────
@@ -40,7 +52,7 @@ def _make_hover(render_mode):
     return HoverEnv(render_mode=render_mode)
 
 def _make_waypoint(render_mode):
-    return WaypointEnv(render_mode=render_mode)
+    return WaypointEnv(render_mode=render_mode, start_pos=WAYPOINT_START_POS)
 
 def _make_gate(render_mode):
     inner = HoverEnv(render_mode=render_mode)
@@ -72,6 +84,75 @@ PPO_DEFAULTS = dict(
 )
 
 DEFAULT_TIMESTEPS = 200_000
+PLAY_COORD_PRINT_EVERY = 5
+
+
+TASK_PROFILES = {
+    "hover": {
+        "env_id": "PyFlyt/QuadX-Hover-v3",
+        "flight_mode": 7,
+        "reward_profile": "hover_dense_progress_v1",
+    },
+    "waypoint": {
+        "env_id": "PyFlyt/QuadX-Waypoints-v3",
+        "flight_mode": 7,
+        "reward_profile": "waypoint_distance_bonus_v1",
+    },
+    "gate": {
+        "env_id": "PyFlyt/QuadX-Hover-v3 + GateEnv",
+        "flight_mode": 7,
+        "reward_profile": "gate_shaping_sparse_v1",
+    },
+}
+
+
+def _load_metadata(task: str, model_path: str) -> dict:
+    profile = TASK_PROFILES[task]
+    metadata = get_or_create_metadata(
+        model_path,
+        task=task,
+        algorithm="PPO",
+        network_description=str(PPO_DEFAULTS["policy"]),
+        env_id=profile["env_id"],
+        flight_mode=profile["flight_mode"],
+        reward_profile=profile["reward_profile"],
+    )
+    return metadata
+
+
+def _bootstrap_timesteps_from_checkpoint(model_path: str, metadata: dict) -> dict:
+    has_model = os.path.exists(model_path + ".zip")
+    total_known = int(metadata.get("total_timesteps", 0)) > 0
+
+    if not has_model or total_known:
+        return metadata
+
+    try:
+        checkpoint = PPO.load(model_path)
+        metadata = set_total_timesteps(metadata, int(checkpoint.num_timesteps))
+        save_metadata(model_path, metadata)
+    except Exception as exc:
+        print(f"[model] WARNING: could not infer timesteps from '{model_path}.zip': {exc}")
+
+    return metadata
+
+
+def _print_model_info(mode: str, model_path: str, metadata: dict) -> None:
+    print(f"[model] mode={mode} path='{model_path}.zip'")
+    print(format_model_info(metadata))
+    print()
+
+
+def _extract_world_pos(obs, info: dict) -> tuple[float, float, float] | None:
+    if "state" in info and info["state"] is not None:
+        state = info["state"]
+        if len(state) >= 3:
+            return (float(state[0]), float(state[1]), float(state[2]))
+
+    if obs is not None and len(obs) >= 13:
+        return (float(obs[10]), float(obs[11]), float(obs[12]))
+
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,13 +163,29 @@ def train(task: str, load_path: str | None, total_timesteps: int) -> None:
     os.makedirs(LOG_DIR,   exist_ok=True)
     os.makedirs(MODEL_DIR, exist_ok=True)
 
+    # Source model for loading metadata visibility (resume or default checkpoint).
+    source_model_path = load_path or os.path.join(MODEL_DIR, f"{task}_ppo")
+    source_meta = _load_metadata(task, source_model_path)
+    source_meta = _bootstrap_timesteps_from_checkpoint(source_model_path, source_meta)
+    _print_model_info("train", source_model_path, source_meta)
+
+    # Target model path that this script saves to.
+    save_path = os.path.join(MODEL_DIR, f"{task}_ppo")
+    save_meta = _load_metadata(task, save_path)
+    save_meta = mark_train_start(
+        save_meta,
+        requested_timesteps=total_timesteps,
+        source_model_if_resumed=(source_model_path if load_path else None),
+    )
+    save_metadata(save_path, save_meta)
+
     env = Monitor(ENV_FACTORIES[task](render_mode=None), LOG_DIR)
 
     print("[check_env] Validating environment API...")
     check_env(env, warn=True)
     print("[check_env] All checks passed.\n")
 
-    model_path = load_path or os.path.join(MODEL_DIR, f"{task}_ppo")
+    model_path = source_model_path
     if load_path and os.path.exists(model_path + ".zip"):
         print(f"[train] Resuming from '{model_path}.zip'...")
         model = PPO.load(model_path, env=env, tensorboard_log=LOG_DIR)
@@ -105,9 +202,17 @@ def train(task: str, load_path: str | None, total_timesteps: int) -> None:
         progress_bar        = True,
     )
 
-    save_path = os.path.join(MODEL_DIR, f"{task}_ppo")
     model.save(save_path)
     print(f"\n[train] Model saved to '{save_path}.zip'")
+
+    save_meta = _load_metadata(task, save_path)
+    save_meta = mark_train_end(
+        save_meta,
+        total_timesteps=int(model.num_timesteps),
+        last_run_timesteps=total_timesteps,
+    )
+    save_metadata(save_path, save_meta)
+
     env.close()
 
 
@@ -121,6 +226,10 @@ def play(task: str, model_path: str | None, n_episodes: int) -> None:
         print(f"[play] ERROR: '{resolved}.zip' not found.")
         print(f"[play] Train first:  uv run python train.py --task {task} --mode train")
         return
+
+    metadata = _load_metadata(task, resolved)
+    metadata = _bootstrap_timesteps_from_checkpoint(resolved, metadata)
+    _print_model_info("play", resolved, metadata)
 
     print(f"[play] Loading '{resolved}.zip'...")
     model = PPO.load(resolved)
@@ -141,10 +250,20 @@ def play(task: str, model_path: str | None, n_episodes: int) -> None:
             done = terminated or truncated
             steps += 1
 
+            if steps % PLAY_COORD_PRINT_EVERY == 0 or done:
+                world_pos = _extract_world_pos(obs, info)
+                if world_pos is not None:
+                    x, y, z = world_pos
+                    print(f"[play]   step={steps:4d}  pos=({x:+.3f}, {y:+.3f}, {z:+.3f})")
+
         gate_tag = "  GATE PASSED" if info.get("gate_passed") else ""
         print(f"[play]   reward={total_reward:.2f}  steps={steps}{gate_tag}")
 
     env.close()
+    metadata = _load_metadata(task, resolved)
+    metadata = set_total_timesteps(metadata, int(model.num_timesteps))
+    metadata = mark_play(metadata, episodes=n_episodes)
+    save_metadata(resolved, metadata)
     print("\n[play] Done.")
 
 

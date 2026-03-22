@@ -9,6 +9,8 @@ dependencies = [
     "numpy>=1.26,<2",
     "PyFlyt==0.28.0",
     "stable-baselines3>=2.3",
+    "tensorboard",
+    "tqdm",
     "rich",
 ]
 
