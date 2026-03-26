@@ -32,9 +32,9 @@ from goals.moving_point import MovingPoint
 PROGRESS_COEF = 5.0
 PROGRESS_CLIP = 0.20
 REACH_RADIUS = 0.15
-REACH_BONUS = 1.50
+REACH_BONUS = 5.0
 CRASH_PENALTY = 5.0
-TIME_PENALTY_PER_STEP = 0.01
+TIME_PENALTY_PER_STEP = 0.03
 
 # ── Spawn and goal sampling ───────────────────────────────────────────────────
 START_XY_RANGE = 1.5
@@ -51,7 +51,7 @@ GOAL_RGBA = (0.2, 0.9, 1.0, 0.35)
 GOAL_VISUAL_RADIUS = REACH_RADIUS
 
 # ── Sim ─────────────────────────────────────────────────────────
-DEFAULT_EPISODE_SECONDS = 25.0
+DEFAULT_EPISODE_SECONDS = 30.0
 DEFAULT_FLIGHT_DOME_SIZE = 10.0  # Must accommodate ±3.0m XY goal range (diagonal ~4.24m + buffer)
 
 class WaypointEnv(BaseDroneEnv):
